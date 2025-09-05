@@ -1,96 +1,83 @@
 import express from "express";
-import cors from "cors";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
-import { fileURLToPath } from "url";
-import ftp from "basic-ftp";
+import cors from "cors";
 import dotenv from "dotenv";
-import history from "connect-history-api-fallback";
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ====== Upload directory ======
-const UPLOAD_DIR = path.join(__dirname, "uploads");
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+const UPLOAD_DIR = path.join(process.cwd(), "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR);
+}
 
-// ====== Multer setup ======
 const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, UPLOAD_DIR),
-  filename: (_, file, cb) => {
-    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, unique + path.extname(file.originalname));
-  },
+  destination: UPLOAD_DIR,
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    const base = path.basename(file.originalname, ext);
+    const utcTime = new Date().toISOString().replace(/[:.]/g, "-"); 
+    cb(null, `${base}-${utcTime}${ext}`);
+  }
 });
+
 const upload = multer({ storage });
 
-// ====== FTP upload helper ======
-async function uploadToFTP(localFilePath, remoteFileName) {
-  if (!process.env.FTP_HOST || !process.env.FTP_USER || !process.env.FTP_PASS) {
-    return { success: false, message: "FTP credentials not set" };
-  }
-
-  const client = new ftp.Client();
-  client.ftp.verbose = false;
-
-  try {
-    await client.access({
-      host: process.env.FTP_HOST,
-      user: process.env.FTP_USER,
-      password: process.env.FTP_PASS,
-      secure: process.env.FTP_SECURE === "true",
-    });
-
-    await client.ensureDir("/uploads");
-    await client.uploadFrom(localFilePath, `uploads/${remoteFileName}`);
-    console.log(`✅ Uploaded to FTP: uploads/${remoteFileName}`);
-    return { success: true };
-  } catch (err) {
-    console.error("❌ FTP Upload Error:", err.message);
-    return { success: false, message: err.message };
-  } finally {
-    client.close();
-  }
-}
-
-// ====== Serve uploaded files ======
+// Serve uploaded files
 app.use("/uploads", express.static(UPLOAD_DIR));
 
-// ====== File upload route ======
-app.post("/upload", upload.array("files", 5), async (req, res) => {
-  const uploadedFiles = [];
+// Upload endpoint
+app.post("/upload", upload.array("files"), (req, res) => {
+  const files = req.files.map((file) => ({
+    originalName: file.originalname,
+    filename: file.filename,
+    localPath: `/uploads/${file.filename}`,
+    sizeKB: (file.size / 1024).toFixed(2),
+    uploadTime: new Date().toISOString(),
 
-  for (let file of req.files) {
-    const localPath = `/uploads/${file.filename}`;
-    const ftpResult = await uploadToFTP(file.path, file.filename);
-
-    uploadedFiles.push({
-      originalName: file.originalname,
-      filename: file.filename,
-      sizeKB: (file.size / 1024).toFixed(2),
-      localPath,
-      ftp: ftpResult,
-    });
-  }
-
-  res.json({ ok: true, files: uploadedFiles });
+  }));
+  res.json({ ok: true, files });
 });
 
-// ====== Serve React build safely ======
-const REACT_BUILD_DIR = path.join(__dirname, "../client/dist");
-if (fs.existsSync(REACT_BUILD_DIR)) {
-  // Use history fallback for React Router
-  app.use(history());
-  app.use(express.static(REACT_BUILD_DIR));
-}
+// List files with pagination and search
+app.get("/files", (req, res) => {
+  const { page = 1, limit = 10, search = "" } = req.query;
+  const allFiles = fs.readdirSync(UPLOAD_DIR).map((filename) => {
+    const filePath = path.join(UPLOAD_DIR, filename);
+    const stats = fs.statSync(filePath);
+    const uploadTime = stats.birthtime instanceof Date ? stats.birthtime.toISOString() : new Date().toISOString();
 
-// ====== Start server ======
+    return {
+      filename,
+      originalName: filename.split("-").slice(1).join("-"), // remove unique prefix
+      localPath: `/uploads/${filename}`,
+      sizeKB: (stats.size / 1024).toFixed(2),
+      uploadTime
+    };
+  });
+
+  const filteredFiles = search
+    ? allFiles.filter((f) =>
+        f.originalName.toLowerCase().includes(search.toLowerCase())
+      )
+    : allFiles;
+
+  const startIndex = (page - 1) * limit;
+  const paginatedFiles = filteredFiles.slice(startIndex, startIndex + Number(limit));
+
+  res.json({
+    ok: true,
+    files: paginatedFiles,
+    total: filteredFiles.length,
+    page: Number(page),
+    limit: Number(limit),
+  });
+});
+
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`✅ Server running at http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
